@@ -1,0 +1,12 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# generated lab artifacts
+**/best_config.json
+
+# OS / editor
+.DS_Store
+*.log
