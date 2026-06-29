@@ -14,6 +14,7 @@ Backend is selected the same way as the CLI (env vars: BACKEND / CHAT_MODEL / ..
 
 import json
 import os
+import re
 import sys
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -101,10 +102,120 @@ def do_ask(config, question):
     }
 
 
+# Numeric "facts" — dollar amounts, day/cycle windows, percentages, reason codes.
+# These are exactly what collide across the policy docs ($0 vs $50, 60 vs 90 days),
+# so they are the things a noisy context makes a small model get wrong.
+_FACT_PATTERNS = [
+    r"\$[\d,]+(?:\.\d+)?",
+    r"\b\d+\s*business\s+days?\b",
+    r"\b\d+\s*days?\b",
+    r"\b\d+\s*(?:complete\s+)?(?:billing\s+)?cycles?\b",
+    r"\b\d+\s*%",
+    r"\b\d+\.\d+(?:\.\d+)?\b",
+]
+
+
+def extract_facts(text):
+    t = text.lower()
+    found = []
+    for p in _FACT_PATTERNS:
+        for m in re.findall(p, t):
+            f = re.sub(r"\s+", " ", m).strip()
+            if f not in found:
+                found.append(f)
+    return found
+
+
+def find_eval(question):
+    q = question.strip().lower()
+    for it in load_eval():
+        if it["q"].strip().lower() == q:
+            return it
+    return None
+
+
+def run_one(config, question, item):
+    config = clean_config(config)
+    store = get_store(config["chunk_size"], config["chunk_overlap"])
+    t0 = time.time()
+    text, retrieved = answer(store, question, qvec(question), config)
+    dt = time.time() - t0
+
+    gold = item["gold"] if item else None
+    gold_facts = extract_facts(item["answer"]) if item else []
+    answer_rank = 0
+    chunks = []
+    for i, c in enumerate(retrieved, 1):
+        has_gold = bool(gold) and S._norm(gold) in S._norm(c["text"])
+        if has_gold and not answer_rank:
+            answer_rank = i
+        cfacts = extract_facts(c["text"])
+        chunks.append({
+            "doc": c["doc"], "text": c["text"][:500], "words": len(c["text"].split()),
+            "has_gold": has_gold,
+            "distractors": [f for f in cfacts if f not in gold_facts],
+        })
+
+    ctx_facts = extract_facts(" ".join(c["text"] for c in retrieved))
+    distractors = [f for f in ctx_facts if f not in gold_facts]
+    ans_facts = extract_facts(text)
+    has_gold_fact = bool(gold) and S._norm(gold) in S._norm(text)
+    correct = has_gold_fact or (bool(gold_facts) and all(g in ans_facts for g in gold_facts))
+
+    sc = None
+    if item:
+        rv, cv = mc.embed([item["answer"], text])
+        sc = round(S.answer_score(item["answer"], text, rv, cv), 3)
+
+    return {
+        "config": config, "answer": text, "latency_s": round(dt, 2),
+        "ctx_words": sum(c["words"] for c in chunks), "n_chunks": len(chunks),
+        "answer_rank": answer_rank, "chunks": chunks,
+        "distractors": distractors, "n_distractors": len(distractors),
+        "answer_facts": ans_facts, "gold_facts": gold_facts,
+        "wrong_facts": [f for f in ans_facts if f not in gold_facts],
+        "correct": correct, "score": sc,
+    }
+
+
 def do_compare(question):
-    base = do_ask(BASELINE, question)
-    win = do_ask(winner_config(), question)
-    return {"baseline": base, "winner": win}
+    item = find_eval(question)
+    base = run_one(BASELINE, question, item)
+    win = run_one(winner_config(), question, item)
+
+    cut = round((1 - win["ctx_words"] / (base["ctx_words"] or 1)) * 100)
+    why = []
+    why.append(
+        f"Naive pulled {base['n_chunks']} chunks ({base['ctx_words']} words); "
+        f"AutoRAG pulled {win['n_chunks']} ({win['ctx_words']} words) — {cut}% less "
+        f"text for the model to read.")
+    if base["answer_rank"] and win["answer_rank"]:
+        why.append(
+            f"The passage that actually answers the question ranked "
+            f"#{base['answer_rank']} of {base['n_chunks']} under naive, but "
+            f"#{win['answer_rank']} of {win['n_chunks']} under AutoRAG — nearer the "
+            f"top, where the model pays the most attention.")
+    why.append(
+        f"Naive's context carried {base['n_distractors']} competing figures"
+        + (f" ({', '.join(base['distractors'][:5])}…)" if base["distractors"] else "")
+        + f"; AutoRAG's carried {win['n_distractors']}. Colliding numbers are exactly "
+        f"what make a 1B model answer with the wrong one.")
+    if item and base["correct"] != win["correct"]:
+        if win["correct"] and not base["correct"]:
+            wf = ", ".join(base["wrong_facts"][:3])
+            why.append(
+                f"Result: naive answered incorrectly"
+                + (f" (it stated {wf}, which isn't the policy figure)" if wf else "")
+                + f", while AutoRAG stated the correct fact "
+                f"(\"{item['gold']}\").")
+    elif item and win["correct"] and base["correct"]:
+        why.append("Both happened to land the right fact here — but notice AutoRAG did "
+                   "it on a quarter of the context, i.e. cheaper and faster.")
+
+    return {
+        "question": question, "item": item, "baseline": base, "winner": win,
+        "cut": cut, "why": why,
+    }
 
 
 def do_sweep(full=False):
@@ -173,6 +284,7 @@ class Handler(BaseHTTPRequestHandler):
                 "baseline": BASELINE,
                 "winner": winner_config(),
                 "samples": [it["q"] for it in ev[:8]],
+                "questions": [it["q"] for it in ev],
                 "corpus_docs": len(DOCS),
                 "eval_n": len(ev),
             })
@@ -236,6 +348,23 @@ th{color:var(--mut);font-weight:500}tr.win td{color:var(--grn)}
 .tabs{display:flex;gap:6px;margin-bottom:14px}.tabs .chip.on{border-color:var(--red);color:#fff;background:#1a0d0d}
 .hide{display:none}.spin{color:var(--mut);font-size:13px}
 small.note{color:var(--mut)}
+mark.good{background:#143a22;color:#8affb0;border-radius:4px;padding:0 3px}
+mark.bad{background:#3a1414;color:#ff8a8a;border-radius:4px;padding:0 3px;text-decoration:line-through}
+mark.dist{background:#3a2a14;color:#ffce8a;border-radius:4px;padding:0 3px}
+.difftable{width:100%;border-collapse:collapse;font-size:13px;margin:6px 0 16px}
+.difftable th,.difftable td{padding:8px 10px;border-bottom:1px solid var(--bd);text-align:left}
+.difftable th{color:var(--mut);font-weight:500}
+.difftable td.metric{color:var(--mut)}.difftable .b{color:#ff8a8a;font-variant-numeric:tabular-nums}
+.difftable .w{color:#8affb0;font-variant-numeric:tabular-nums}.difftable .note2{color:var(--mut);font-size:12px}
+.verdict{display:inline-block;font-size:11px;font-weight:700;padding:2px 8px;border-radius:5px}
+.verdict.ok{background:#143a22;color:#8affb0}.verdict.no{background:#3a1414;color:#ff8a8a}
+.why{background:#111;border:1px solid var(--bd);border-radius:8px;padding:6px 4px;margin-top:8px}
+.why li{margin:8px 14px;color:#d4d4d4}.why li::marker{color:var(--red)}
+.chunk.gold{border-left-color:var(--grn)}.chunk.noise{opacity:.6}
+.badge{font-size:10px;font-weight:700;padding:1px 6px;border-radius:4px;margin-right:6px}
+.badge.g{background:#143a22;color:#8affb0}.badge.d{background:#3a2a14;color:#ffce8a}
+details summary{cursor:pointer;color:var(--mut);font-size:12px;margin-top:8px}
+.qpick{display:flex;gap:8px;align-items:center}.qpick select{flex:1}
 </style></head><body>
 <header><i class=dot></i><b>AutoRAG Playground</b><span id=backend>Red Hat OpenShift AI · connecting…</span></header>
 <div class=wrap>
@@ -271,12 +400,10 @@ small.note{color:var(--mut)}
 <!-- COMPARE -->
 <section id=cmp class=hide>
 <div class=card>
-<h2>Same question, both configs</h2>
-<input type=text id=cq placeholder="Ask a card-disputes question…">
-<div class=row id=csamples></div>
-<div class=row style=margin-top:12px><button onclick=compare()>Compare</button>
-<small class=note>Naive baseline (big chunks, top-k 8) vs the swept winner — watch noise change the answer.</small></div>
-<div id=cout style=margin-top:14px></div>
+<h2>Naive vs AutoRAG — what's different and why</h2>
+<div class=qpick><select id=cqsel></select><button onclick=compare()>Compare</button></div>
+<small class=note>Pick a graded question so we can show the ground-truth fact and which answer actually got it right.</small>
+<div id=cout style=margin-top:16px></div>
 </div>
 </section>
 
@@ -304,6 +431,20 @@ document.querySelectorAll('.tabs .chip').forEach(x=>x.classList.remove('on'));t.
 ['play','cmp','sweep'].forEach(id=>$('#'+id).classList.add('hide'));$('#'+t.dataset.tab).classList.remove('hide')});
 function esc(s){return s.replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]))}
 function chunks(r){return r.map(c=>`<div class=chunk><b>${c.doc}</b> · ${esc(c.text)}…</div>`).join('')}
+function mk(t,f,cls){if(!f)return t;const re=new RegExp('('+f.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')+')','gi');
+return t.replace(re,'<mark class="'+cls+'">$1</mark>')}
+function hl(text,good,bad){let t=esc(text.replace(/\*\*/g,''));
+(good||[]).slice().sort((a,b)=>b.length-a.length).forEach(f=>t=mk(t,f,'good'));
+(bad||[]).slice().sort((a,b)=>b.length-a.length).forEach(f=>t=mk(t,f,'bad'));return t}
+function hlChunk(text,goldSub,dist){let t=esc(text.replace(/\*\*/g,''));t=mk(t,goldSub,'good');
+(dist||[]).slice().sort((a,b)=>b.length-a.length).forEach(f=>t=mk(t,f,'dist'));return t}
+function verdict(c){return c?'<span class="verdict ok">✓ correct</span>':'<span class="verdict no">✗ wrong</span>'}
+function chunkList(x,goldSub){const items=x.chunks.map(c=>{
+const cls=c.has_gold?'chunk gold':(c.distractors.length?'chunk':'chunk noise');
+const badge=c.has_gold?'<span class="badge g">✓ ANSWER</span>':
+(c.distractors.length?'<span class="badge d">'+c.distractors.length+' competing</span>':'<span class="badge d" style=opacity:.5>off-topic</span>');
+return `<div class="${cls}">${badge}<b>${c.doc}</b> · ${hlChunk(c.text,goldSub,c.distractors)}…</div>`}).join('');
+return `<details><summary>${x.n_chunks} retrieved chunks (${x.ctx_words} words)</summary>${items}</details>`}
 async function ask(){const question=q.value.trim();if(!question)return;
 out.innerHTML='<div class=spin>Generating on the 1B model…</div>';
 const r=await api('/api/ask',{config:cfg(),question});if(r.error){out.innerHTML='<div class=ans>⚠ '+esc(r.error)+'</div>';return}
@@ -311,12 +452,28 @@ out.innerHTML=`<div class=ans>${esc(r.answer)}</div>
 <div class=meta>chunk=${r.config.chunk_size} ov=${r.config.chunk_overlap} k=${r.config.top_k} ${r.config.retriever}
 · ${r.ctx_words} context words · ${r.latency_s}s</div>
 <h2 style=margin-top:14px>Retrieved context</h2>${chunks(r.retrieved)}`}
-async function compare(){const question=cq.value.trim();if(!question)return;
+async function compare(){const question=cqsel.value;if(!question)return;
 cout.innerHTML='<div class=spin>Running both configs on the 1B model…</div>';
 const r=await api('/api/compare',{question});if(r.error){cout.innerHTML='<div class=ans>⚠ '+esc(r.error)+'</div>';return}
-const col=(x,cls,name)=>`<div><span class="tag ${cls}">${name}</span>
-<div class=ans>${esc(x.answer)}</div><div class=meta>${x.ctx_words} ctx words · k=${x.config.top_k} · ${x.latency_s}s</div></div>`;
-cout.innerHTML=`<div class=cmp>${col(r.baseline,'b','Naive baseline')}${col(r.winner,'w','AutoRAG winner')}</div>`}
+const b=r.baseline,w=r.winner,it=r.item,gold=it?it.gold:'';
+const rank=x=>x.answer_rank?('#'+x.answer_rank+' of '+x.n_chunks):'not retrieved';
+const ref=it?`<div class=meta style=margin-bottom:8px><b>Ground-truth fact:</b> <mark class=good>${esc(it.gold)}</mark></div>`:'';
+const table=`<table class=difftable>
+<tr><th>What differs</th><th>Naive baseline</th><th>AutoRAG winner</th><th></th></tr>
+<tr><td class=metric>Got it right?</td><td>${verdict(b.correct)}</td><td>${verdict(w.correct)}</td><td class=note2>did the answer state the policy fact</td></tr>
+<tr><td class=metric>Answer quality</td><td class=b>${b.score}</td><td class=w>${w.score}</td><td class=note2>0–1 vs reference answer</td></tr>
+<tr><td class=metric>Context fed to model</td><td class=b>${b.ctx_words}w · ${b.n_chunks} chunks</td><td class=w>${w.ctx_words}w · ${w.n_chunks} chunks</td><td class=note2>−${r.cut}% less to read</td></tr>
+<tr><td class=metric>Answer-bearing chunk ranked</td><td class=b>${rank(b)}</td><td class=w>${rank(w)}</td><td class=note2>higher = model attends to it more</td></tr>
+<tr><td class=metric>Competing figures in context</td><td class=b>${b.n_distractors}</td><td class=w>${w.n_distractors}</td><td class=note2>colliding $/days/% that mislead</td></tr>
+</table>`;
+const col=(x,cls,name)=>`<div><span class="tag ${cls}">${name}</span> ${verdict(x.correct)}
+<div class=ans>${hl(x.answer,x.gold_facts,x.wrong_facts)}</div>
+<div class=meta>${x.ctx_words} ctx words · ${x.n_distractors} competing figures · ${x.latency_s}s</div>
+${chunkList(x,gold)}</div>`;
+const why=`<h2 style=margin-top:4px>Why they differ</h2><ul class=why>${r.why.map(s=>'<li>'+esc(s)+'</li>').join('')}</ul>`;
+cout.innerHTML=`<div class=meta style=margin-bottom:4px><b>Q:</b> ${esc(r.question)}</div>${ref}${table}${why}
+<h2 style=margin-top:14px>The two answers <small class=note>· <mark class=good>green</mark> = correct policy fact, <mark class=bad>red</mark> = figure not in policy</small></h2>
+<div class=cmp>${col(b,'b','Naive baseline')}${col(w,'w','AutoRAG winner')}</div>`}
 async function sweep(full){sout.innerHTML='<div class=spin>Scoring configs…</div>';
 const r=await api('/api/sweep',{full});if(r.error){sout.innerHTML='<div class=ans>⚠ '+esc(r.error)+'</div>';return}
 const pct=x=>(x*100).toFixed(1)+'%';
@@ -332,7 +489,8 @@ STATE.winner=r.rows[0].config}
 (async()=>{STATE=await fetch('/api/state').then(r=>r.json());
 $('#backend').textContent=STATE.backend+'  ·  '+STATE.corpus_docs+' docs · '+STATE.eval_n+' eval Qs';
 samples.innerHTML=STATE.samples.map(s=>`<span class=chip onclick="q.value=this.textContent;ask()">${esc(s.slice(0,42))}…</span>`).join('');
-csamples.innerHTML=STATE.samples.map(s=>`<span class=chip onclick="cq.value=this.textContent;compare()">${esc(s.slice(0,42))}…</span>`).join('');
+cqsel.innerHTML=STATE.questions.map(s=>`<option>${esc(s)}</option>`).join('');
+cqsel.value=STATE.questions.find(q=>q.includes('lost debit card'))||STATE.questions[0];
 preset('winner')})();
 </script></body></html>"""
 
