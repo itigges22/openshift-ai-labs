@@ -26,6 +26,27 @@ or the **"Adopt in your stack"** tab in the playground.
 
 ---
 
+## Scope: a minimal, honest demo
+
+This runs the **real** AutoRAG loop — define a config space, evaluate every config
+against an eval set, score it, pick the winner — with real embeddings, real
+retrieval, and a real local 1B model generating the answers. Nothing is scripted
+or hardcoded (the only fake path is the opt-in `BACKEND=stub` for offline CI).
+
+It is **not** the full open-source [AutoRAG](https://github.com/Marker-Inc-Korea/AutoRAG)
+project or a production platform. To keep it laptop-sized and readable, this demo:
+
+- sweeps **4 knobs** (chunk size, overlap, top-k, retriever) — full tooling also
+  sweeps embedding models, rerankers, query expansion/HyDE, and prompt templates;
+- does an **exhaustive grid search** rather than greedy node-wise optimization;
+- scores on a **deterministic gold-phrase retrieval metric** (fast, no LLM in the
+  loop) rather than an LLM-judge for faithfulness/answer-correctness;
+- uses an **in-memory vector store** rather than a managed vector DB.
+
+So: the method is genuine and running; the search space and metrics are a
+deliberately small slice. The code is structured so you can widen the grid or swap
+the metric/store without touching the loop.
+
 ## The pain point this fixes
 
 RAG has a dozen knobs — chunk size, overlap, top-k, dense vs. lexical vs. hybrid
