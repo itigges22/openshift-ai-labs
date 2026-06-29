@@ -450,6 +450,10 @@ button{background:var(--red);color:#fff;border:0;border-radius:8px;padding:10px 
 font-weight:600;cursor:pointer;font-family:var(--rhd)}
 button.ghost{background:#111;border:1px solid var(--bd);color:var(--txt);font-weight:500}
 button.preset.active{border-color:var(--red);color:#fff;background:#1a0d0d;box-shadow:0 0 0 1px var(--red) inset}
+button.preset.locked{opacity:.5;cursor:not-allowed;border-style:dashed}
+.lockhint{font-size:12px;color:var(--mut);margin-top:10px;line-height:1.5}.lockhint b{color:var(--txt)}
+.gate{background:#111;border:1px solid var(--bd);border-left:3px solid var(--red);border-radius:8px;padding:14px 16px;color:var(--mut)}
+.gate b{color:var(--txt)}.gate button{margin-left:6px}
 button:disabled{opacity:.5;cursor:wait}
 .chip{background:#111;border:1px solid var(--bd);color:var(--mut);border-radius:999px;padding:6px 11px;
 font-size:12px;cursor:pointer}.chip:hover{border-color:var(--red);color:var(--txt)}
@@ -512,6 +516,7 @@ padding:0 4px;font:12px var(--rhm)}
 <h2>Retrieval config</h2>
 <div class=row><button id=presetBase class="ghost preset" onclick="preset('baseline')">Naive baseline</button>
 <button id=presetWin class="ghost preset" onclick="preset('winner')">AutoRAG winner</button></div>
+<div id=winhint class=lockhint></div>
 <label>Chunk size <span class=val id=csv>150</span></label><input type=range id=cs min=20 max=300 step=10 value=150>
 <label>Overlap <span class=val id=ovv>30</span></label><input type=range id=ov min=0 max=120 step=10 value=30>
 <label>Top-k <span class=val id=tkv>3</span></label><input type=range id=tk min=1 max=10 step=1 value=3>
@@ -567,10 +572,10 @@ padding:0 4px;font:12px var(--rhm)}
 <!-- SWEEP -->
 <section id=sweep class=hide>
 <div class=card>
-<h2>Measure configs instead of guessing</h2>
-<div class=row><button onclick="sweep(false)">Quick sweep (16)</button>
-<button class=ghost onclick="sweep(true)">Full sweep (144)</button>
-<small class=note>Scores every config on retrieval — no LLM calls — then sets the winner used elsewhere.</small></div>
+<h2>The AutoRAG eval — measure configs instead of guessing</h2>
+<div class=row><button onclick="sweep(false)">Run AutoRAG (16 configs)</button>
+<button class=ghost onclick="sweep(true)">Full sweep (144 configs)</button>
+<small class=note>Scores every config on the eval set's retrieval — no LLM calls — and selects the winner. <b>This is what unlocks the “AutoRAG winner” everywhere else.</b></small></div>
 <div id=sout style=margin-top:12px></div>
 </div>
 </section>
@@ -586,9 +591,15 @@ function sync(){csv.textContent=cs.value;ovv.textContent=ov.value;tkv.textConten
 function clearPreset(){presetBase.classList.remove('active');presetWin.classList.remove('active')}
 ['input','change'].forEach(e=>['cs','ov','tk'].forEach(id=>$('#'+id).addEventListener(e,()=>{sync();clearPreset()})));
 rt.addEventListener('change',clearPreset);
-function preset(which){const c=STATE[which];if(!c)return;cs.value=c.chunk_size;ov.value=c.chunk_overlap;
-tk.value=c.top_k;rt.value=c.retriever;sync();
+function preset(which){if(which==='winner'&&!STATE.swept)return;const c=STATE[which];if(!c)return;
+cs.value=c.chunk_size;ov.value=c.chunk_overlap;tk.value=c.top_k;rt.value=c.retriever;sync();
 presetBase.classList.toggle('active',which==='baseline');presetWin.classList.toggle('active',which==='winner')}
+function goTab(n){const c=document.querySelector('.tabs .chip[data-tab='+n+']');if(c)c.click()}
+function gate(msg){return '<div class=gate>🔒 '+msg+' <button onclick="goTab(\'sweep\')">Run AutoRAG</button></div>'}
+function lockWinner(){STATE.swept=false;presetWin.disabled=true;presetWin.classList.add('locked');presetWin.classList.remove('active');
+winhint.innerHTML='🔒 <b>AutoRAG winner is locked.</b> Run the AutoRAG eval (the “Run the sweep” tab) to compute it from the eval set.'}
+function unlockWinner(){STATE.swept=true;presetWin.disabled=false;presetWin.classList.remove('locked');const c=STATE.winner;
+winhint.innerHTML='✓ <b>Winner from the AutoRAG eval:</b> chunk='+c.chunk_size+' · ov='+c.chunk_overlap+' · k='+c.top_k+' · '+c.retriever+' — measured best on the eval set.'}
 document.querySelectorAll('.tabs .chip').forEach(t=>t.onclick=()=>{
 document.querySelectorAll('.tabs .chip').forEach(x=>x.classList.remove('on'));t.classList.add('on');
 ['play','doc','cmp','sweep','adopt'].forEach(id=>$('#'+id).classList.add('hide'));$('#'+t.dataset.tab).classList.remove('hide');
@@ -630,7 +641,8 @@ if(r.error){dout.innerHTML='<div class=ans>⚠ '+esc(r.error)+'</div>';return}
 dout.innerHTML=`<div class=ans>${hl(r.answer,[],[])}</div>
 <div class=meta>${r.n_chunks_total} chunks indexed · ${r.ctx_words} words retrieved · ${r.latency_s}s${r.truncated?' · doc truncated to 20k words':''}</div>
 <h2 style=margin-top:14px>Retrieved from your document</h2>${chunks(r.retrieved)}`}
-async function askDocCompare(){const text=doctext.value.trim(),question=dq.value.trim(),gold=dgold.value.trim();
+async function askDocCompare(){if(!STATE.swept){dout.innerHTML=gate('Run the <b>AutoRAG eval</b> first — it computes the winner config this compares against.');return}
+const text=doctext.value.trim(),question=dq.value.trim(),gold=dgold.value.trim();
 if(!text){dout.innerHTML='<div class=ans>Paste or upload a document first.</div>';return}
 if(!question){dout.innerHTML='<div class=ans>Ask a question about your document.</div>';return}
 dout.innerHTML='<div class=spin>Running naive vs AutoRAG on your document…</div>';
@@ -655,7 +667,8 @@ ${gold?'<div class=meta style=margin-bottom:8px><b>Your key fact:</b> <mark clas
 <h2 style=margin-top:4px>Why they differ</h2><ul class=why>${r.why.map(s=>'<li>'+esc(s)+'</li>').join('')}</ul>
 <h2 style=margin-top:14px>The two answers${gold?' <small class=note>· <mark class=good>green</mark> = your fact, <mark class=bad>red</mark> = figure not in it</small>':''}</h2>
 <div class=cmp>${col(b,'b','Naive baseline')}${col(w,'w','AutoRAG winner')}</div>`}
-async function compare(){const question=cqsel.value;if(!question)return;
+async function compare(){if(!STATE.swept){cout.innerHTML=gate('Run the <b>AutoRAG eval</b> first — it computes the winner this tab compares against.');return}
+const question=cqsel.value;if(!question)return;
 cout.innerHTML='<div class=spin>Running both configs on the 1B model…</div>';
 const r=await api('/api/compare',{question});if(r.error){cout.innerHTML='<div class=ans>⚠ '+esc(r.error)+'</div>';return}
 const b=r.baseline,w=r.winner,it=r.item,gold=it?it.gold:'';
@@ -688,10 +701,12 @@ sout.innerHTML=`<table><tr><th>recall</th><th>mrr</th><th>ctx</th><th>config</th
 <div class=meta style=margin-top:10px>Naive baseline: recall ${pct(b.context_recall)} · mrr ${b.mrr.toFixed(3)} · ${Math.round(b.avg_ctx_words)}w —
 winner uses <b style=color:var(--grn)>${Math.round((1-r.rows[0].avg_ctx_words/b.avg_ctx_words)*100)}% less context</b> at equal recall.
 Winner is now the “AutoRAG winner” preset on the Play tab.</div>`;
-STATE.winner=r.rows[0].config;renderAdopt()}
+STATE.winner=r.rows[0].config;unlockWinner();preset('winner');renderAdopt()}
 function pre(code){return '<pre><code>'+esc(code)+'</code><button class=copy onclick="cp(this)">copy</button></pre>'}
 function cp(b){navigator.clipboard.writeText(b.previousElementSibling.textContent);b.textContent='copied';setTimeout(()=>b.textContent='copy',1200)}
-function renderAdopt(){const c=STATE.winner,W=c.chunk_size,O=c.chunk_overlap,K=c.top_k,R=c.retriever;
+function renderAdopt(){if(!STATE.swept){$('#adopt').innerHTML='<div class=card><h2>Your winning config</h2>'
++gate('Run the <b>AutoRAG eval</b> first — it finds the winning config these snippets are built from.')+'</div>';return}
+const c=STATE.winner,W=c.chunk_size,O=c.chunk_overlap,K=c.top_k,R=c.retriever;
 const raw=(doctext.value||'').trim();const hasdoc=raw.length>0;
 const TQ=String.fromCharCode(34).repeat(3);
 const docex=(hasdoc?raw.slice(0,700):'Paste your document text here — or import one in the "Import your own doc" tab.').replace(new RegExp(TQ,'g'),'\\"\\"\\"');
@@ -762,7 +777,7 @@ $('#backend').textContent=STATE.backend+'  ·  '+STATE.corpus_docs+' docs · '+S
 samples.innerHTML=STATE.samples.map(s=>`<span class=chip onclick="q.value=this.textContent;ask()">${esc(s)}</span>`).join('');
 cqsel.innerHTML=STATE.questions.map(s=>`<option>${esc(s)}</option>`).join('');
 cqsel.value=STATE.questions.find(q=>q.includes('lost debit card'))||STATE.questions[0];
-preset('winner');renderAdopt()})();
+lockWinner();preset('baseline');renderAdopt()})();
 </script></body></html>"""
 
 
