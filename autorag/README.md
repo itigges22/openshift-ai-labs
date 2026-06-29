@@ -17,6 +17,13 @@ you, in real numbers, why the RAG config you guessed is costing you accuracy.
 
 > Your numbers will vary a little run-to-run — it's a real model, not a fixture.
 
+**This is a technique, not a platform lock-in.** AutoRAG = "search your RAG config
+against an eval set instead of guessing." The whole optimizer is ~200 lines of
+pure Python you own. Run it on your laptop, point the winning config at your
+LangChain / LlamaIndex / vector-DB stack, and scale the *same code* to a vLLM
+endpoint on Red Hat OpenShift AI by changing one env var. **→ See [`ADOPT.md`](ADOPT.md)**
+or the **"Adopt in your stack"** tab in the playground.
+
 ---
 
 ## The pain point this fixes

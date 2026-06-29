@@ -365,6 +365,16 @@ mark.dist{background:#3a2a14;color:#ffce8a;border-radius:4px;padding:0 3px}
 .badge.g{background:#143a22;color:#8affb0}.badge.d{background:#3a2a14;color:#ffce8a}
 details summary{cursor:pointer;color:var(--mut);font-size:12px;margin-top:8px}
 .qpick{display:flex;gap:8px;align-items:center}.qpick select{flex:1}
+pre{position:relative;background:#0d0d0d;border:1px solid var(--bd);border-radius:8px;padding:12px;overflow:auto;
+font:12.5px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;color:#d4d4d4;margin:4px 0 14px}
+pre code{white-space:pre}
+.copy{position:absolute;top:8px;right:8px;background:#222;border:1px solid var(--bd);color:var(--mut);
+font-size:11px;padding:3px 8px;border-radius:6px;font-weight:500;cursor:pointer}
+.cfgline{font-size:16px;margin:6px 0}.cfgline b{color:#8affb0}
+.tag.n{background:#222;color:#cfcfcf}
+ol.steps{margin:6px 0;padding-left:20px}ol.steps li{margin:8px 0;color:#d4d4d4}
+ol.steps code,small code,.note code,li code{background:#0d0d0d;border:1px solid var(--bd);border-radius:4px;
+padding:0 4px;font:12px ui-monospace,monospace}
 </style></head><body>
 <header><i class=dot></i><b>AutoRAG Playground</b><span id=backend>Red Hat OpenShift AI · connecting…</span></header>
 <div class=wrap>
@@ -372,6 +382,7 @@ details summary{cursor:pointer;color:var(--mut);font-size:12px;margin-top:8px}
 <div class="chip on" data-tab=play>Play (one config)</div>
 <div class=chip data-tab=cmp>Baseline vs AutoRAG</div>
 <div class=chip data-tab=sweep>Run the sweep</div>
+<div class=chip data-tab=adopt>Adopt in your stack</div>
 </div>
 
 <!-- PLAY -->
@@ -417,6 +428,9 @@ details summary{cursor:pointer;color:var(--mut);font-size:12px;margin-top:8px}
 <div id=sout style=margin-top:12px></div>
 </div>
 </section>
+
+<!-- ADOPT -->
+<section id=adopt class=hide></section>
 </div>
 <script>
 const $=s=>document.querySelector(s), api=(p,b)=>fetch(p,{method:'POST',body:JSON.stringify(b||{})}).then(r=>r.json());
@@ -428,7 +442,7 @@ function preset(which){const c=STATE[which];if(!c)return;cs.value=c.chunk_size;o
 tk.value=c.top_k;rt.value=c.retriever;sync()}
 document.querySelectorAll('.tabs .chip').forEach(t=>t.onclick=()=>{
 document.querySelectorAll('.tabs .chip').forEach(x=>x.classList.remove('on'));t.classList.add('on');
-['play','cmp','sweep'].forEach(id=>$('#'+id).classList.add('hide'));$('#'+t.dataset.tab).classList.remove('hide')});
+['play','cmp','sweep','adopt'].forEach(id=>$('#'+id).classList.add('hide'));$('#'+t.dataset.tab).classList.remove('hide')});
 function esc(s){return s.replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]))}
 function chunks(r){return r.map(c=>`<div class=chunk><b>${c.doc}</b> · ${esc(c.text)}…</div>`).join('')}
 function mk(t,f,cls){if(!f)return t;const re=new RegExp('('+f.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')+')','gi');
@@ -485,13 +499,47 @@ sout.innerHTML=`<table><tr><th>recall</th><th>mrr</th><th>ctx</th><th>config</th
 <div class=meta style=margin-top:10px>Naive baseline: recall ${pct(b.context_recall)} · mrr ${b.mrr.toFixed(3)} · ${Math.round(b.avg_ctx_words)}w —
 winner uses <b style=color:var(--grn)>${Math.round((1-r.rows[0].avg_ctx_words/b.avg_ctx_words)*100)}% less context</b> at equal recall.
 Winner is now the “AutoRAG winner” preset on the Play tab.</div>`;
-STATE.winner=r.rows[0].config}
+STATE.winner=r.rows[0].config;renderAdopt()}
+function pre(code){return '<pre><code>'+esc(code)+'</code><button class=copy onclick="cp(this)">copy</button></pre>'}
+function cp(b){navigator.clipboard.writeText(b.previousElementSibling.textContent);b.textContent='copied';setTimeout(()=>b.textContent='copy',1200)}
+function renderAdopt(){const c=STATE.winner,W=c.chunk_size,O=c.chunk_overlap,K=c.top_k,R=c.retriever;
+const lc='from langchain_text_splitters import RecursiveCharacterTextSplitter\n\n'
++'# AutoRAG winner on THIS data: chunk='+W+'w  overlap='+O+'w  k='+K+'  '+R+'\n'
++'# chunk size is in WORDS here; LangChain counts characters, so x5 (or use a token splitter)\n'
++'splitter = RecursiveCharacterTextSplitter(chunk_size='+(W*5)+', chunk_overlap='+(O*5)+')\n'
++'retriever = vectordb.as_retriever(search_kwargs={"k": '+K+'})';
+const li='from llama_index.core.node_parser import SentenceSplitter\n\n'
++'splitter = SentenceSplitter(chunk_size='+W+', chunk_overlap='+O+')\n'
++'query_engine = index.as_query_engine(similarity_top_k='+K+')';
+const env='# point the SAME sweep at a vLLM endpoint (e.g. on Red Hat OpenShift AI)\n'
++'export BACKEND=openai\n'
++'export OPENAI_BASE=https://<your-vllm-route>/v1\n'
++'export CHAT_MODEL=<served-model-name>\n'
++'python3 autorag.py sweep';
+$('#adopt').innerHTML=`<div class=card>
+<h2>Your current winning config</h2>
+<div class=cfgline>chunk=<b>${W}</b> words · overlap=<b>${O}</b> · top-k=<b>${K}</b> · retriever=<b>${R}</b></div>
+<small class=note>What the sweep found on the loaded corpus + eval set. Swap in your data, re-run the sweep, and these numbers change.</small>
+<h2 style=margin-top:18px>Paste it into your stack</h2>
+<div class="tag n">LangChain</div>${pre(lc)}
+<div class="tag n">LlamaIndex</div>${pre(li)}
+<div class="tag n">Scale to vLLM / OpenShift AI — same code, one env var</div>${pre(env)}
+<h2 style=margin-top:8px>Use a different vector DB? Keep the sweep, swap two functions</h2>
+${pre('def index(chunks) -> store               # embed + insert (FAISS / Chroma / pgvector)\ndef retrieve(store, query, k) -> chunks   # dense / lexical / hybrid')}
+<small class=note>See where they're called in <code>rag/pipeline.py</code>; reference store is <code>rag/store.py</code>.</small>
+<h2 style=margin-top:18px>Make it your own (2 swaps)</h2>
+<ol class=steps>
+<li><b>Your corpus</b> — replace <code>corpus/*.md</code> with your documents.</li>
+<li><b>Your eval</b> — replace <code>eval/qa.jsonl</code> with ~15–20 real questions, each with a <code>gold</code> phrase that must be retrieved. Then run <code>python3 autorag.py sweep</code>.</li>
+</ol>
+<small class=note>Full guide in <code>autorag/ADOPT.md</code>. The whole optimizer is ~200 lines — read it, copy it, it's yours. AutoRAG is a technique, not a platform lock-in.</small>
+</div>`}
 (async()=>{STATE=await fetch('/api/state').then(r=>r.json());
 $('#backend').textContent=STATE.backend+'  ·  '+STATE.corpus_docs+' docs · '+STATE.eval_n+' eval Qs';
 samples.innerHTML=STATE.samples.map(s=>`<span class=chip onclick="q.value=this.textContent;ask()">${esc(s.slice(0,42))}…</span>`).join('');
 cqsel.innerHTML=STATE.questions.map(s=>`<option>${esc(s)}</option>`).join('');
 cqsel.value=STATE.questions.find(q=>q.includes('lost debit card'))||STATE.questions[0];
-preset('winner')})();
+preset('winner');renderAdopt()})();
 </script></body></html>"""
 
 
