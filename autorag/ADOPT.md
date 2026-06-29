@@ -3,7 +3,8 @@
 AutoRAG isn't a product you buy or a platform feature you have to be on. It's a
 **technique** — *search your RAG config space against an eval set instead of
 guessing* — and this lab is a complete, dependency-free implementation of it. The
-whole optimizer is ~200 lines you already have: `autorag.py`, `rag/`, `eval/`.
+whole optimizer is a few hundred lines you already have — `autorag.py` (~320
+lines), plus `rag/`, `eval/`, and `model_client.py` (~750 lines in total).
 
 This page is how you put it on **your** retrieval stack.
 

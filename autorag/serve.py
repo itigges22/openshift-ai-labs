@@ -726,7 +726,7 @@ const docex=(hasdoc?raw.slice(0,700):'Paste your document text here — or impor
 const q=((dq.value||'').trim()||'What are the key terms?').replace(/"/g,'\\"');
 const hyb=R==='hybrid';
 const lab='# End-to-end on YOUR document, with the AutoRAG-winning config.\n'
-+'# This IS the playground\'s code: model_client.py + rag/ — pure stdlib + Ollama, ~200 lines you own.\n'
++'# This IS the playground\'s code: model_client.py + rag/ — pure stdlib + Ollama, a few hundred lines you own.\n'
 +'import model_client as mc                 # Ollama | vLLM | OpenAI-compatible | stub (one interface)\n'
 +'from rag.chunk import build_chunks\n'
 +'from rag.pipeline import build_store, answer\n\n'
