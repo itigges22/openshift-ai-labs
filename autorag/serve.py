@@ -135,15 +135,14 @@ def find_eval(question):
     return None
 
 
-def run_one(config, question, item):
-    config = clean_config(config)
-    store = get_store(config["chunk_size"], config["chunk_overlap"])
+def run_one_store(store, config, question, gold=None, reference=None):
+    """Analyze one config's answer on a given store. gold/reference are optional,
+    so this serves both graded corpus questions and ad-hoc user documents."""
     t0 = time.time()
     text, retrieved = answer(store, question, qvec(question), config)
     dt = time.time() - t0
 
-    gold = item["gold"] if item else None
-    gold_facts = extract_facts(item["answer"]) if item else []
+    gold_facts = extract_facts(reference) if reference else []
     answer_rank = 0
     chunks = []
     for i, c in enumerate(retrieved, 1):
@@ -161,12 +160,13 @@ def run_one(config, question, item):
     distractors = [f for f in ctx_facts if f not in gold_facts]
     ans_facts = extract_facts(text)
     has_gold_fact = bool(gold) and S._norm(gold) in S._norm(text)
-    correct = has_gold_fact or (bool(gold_facts) and all(g in ans_facts for g in gold_facts))
+    correct = (has_gold_fact or (bool(gold_facts) and all(g in ans_facts for g in gold_facts))) \
+        if gold else None
 
     sc = None
-    if item:
-        rv, cv = mc.embed([item["answer"], text])
-        sc = round(S.answer_score(item["answer"], text, rv, cv), 3)
+    if reference:
+        rv, cv = mc.embed([reference, text])
+        sc = round(S.answer_score(reference, text, rv, cv), 3)
 
     return {
         "config": config, "answer": text, "latency_s": round(dt, 2),
@@ -177,6 +177,76 @@ def run_one(config, question, item):
         "wrong_facts": [f for f in ans_facts if f not in gold_facts],
         "correct": correct, "score": sc,
     }
+
+
+def run_one(config, question, item):
+    config = clean_config(config)
+    store = get_store(config["chunk_size"], config["chunk_overlap"])
+    gold = item["gold"] if item else None
+    reference = item["answer"] if item else None
+    return run_one_store(store, config, question, gold, reference)
+
+
+def _why(base, win, cut, gold=None, gold_label="the policy fact", gold_value=None):
+    why = [
+        f"Naive pulled {base['n_chunks']} chunks ({base['ctx_words']} words); "
+        f"AutoRAG pulled {win['n_chunks']} ({win['ctx_words']} words) — {cut}% less "
+        f"text for the model to read."
+    ]
+    if base["answer_rank"] and win["answer_rank"]:
+        why.append(
+            f"The passage that actually answers the question ranked "
+            f"#{base['answer_rank']} of {base['n_chunks']} under naive, but "
+            f"#{win['answer_rank']} of {win['n_chunks']} under AutoRAG — nearer the "
+            f"top, where the model pays the most attention.")
+    why.append(
+        f"Naive's context carried {base['n_distractors']} competing figures"
+        + (f" ({', '.join(base['distractors'][:5])}…)" if base["distractors"] else "")
+        + f"; AutoRAG's carried {win['n_distractors']}. Colliding numbers are exactly "
+        f"what make a 1B model answer with the wrong one.")
+    if gold and base["correct"] is not None and base["correct"] != win["correct"]:
+        if win["correct"] and not base["correct"]:
+            wf = ", ".join(base["wrong_facts"][:3])
+            why.append(
+                "Result: naive answered incorrectly"
+                + (f" (it stated {wf}, not {gold_label})" if wf else "")
+                + f", while AutoRAG stated {gold_label}"
+                + (f" (\"{gold_value}\")" if gold_value else "") + ".")
+    elif gold and win["correct"] and base["correct"]:
+        why.append("Both happened to land the right fact here — but AutoRAG did it on a "
+                   "fraction of the context, i.e. cheaper and faster.")
+    return why
+
+
+def do_compare_doc(text, question, gold):
+    text = (text or "").strip()
+    if not text:
+        return {"error": "Paste or upload a document first."}
+    if not (question or "").strip():
+        return {"error": "Ask a question about your document."}
+    words = text.split()
+    truncated = len(words) > 20000
+    if truncated:
+        text = " ".join(words[:20000])
+    gold = (gold or "").strip() or None
+
+    def docstore(cfg):
+        key = (hash(text), cfg["chunk_size"], cfg["chunk_overlap"])
+        if key not in _doc_cache:
+            chunks = build_chunks([{"doc": "your-document", "text": text}],
+                                  cfg["chunk_size"], cfg["chunk_overlap"])
+            vecs = mc.embed([c["text"] for c in chunks])
+            _doc_cache[key] = build_store(chunks, vecs)
+        return _doc_cache[key]
+
+    win = clean_config(winner_config())
+    base_cfg = clean_config(BASELINE)
+    base = run_one_store(docstore(base_cfg), base_cfg, question, gold, gold)
+    wino = run_one_store(docstore(win), win, question, gold, gold)
+    cut = round((1 - wino["ctx_words"] / (base["ctx_words"] or 1)) * 100)
+    why = _why(base, wino, cut, gold=gold, gold_label="your key fact", gold_value=gold)
+    return {"question": question, "gold": gold, "baseline": base, "winner": wino,
+            "cut": cut, "why": why, "truncated": truncated}
 
 
 def do_ask_doc(text, config, question):
@@ -337,6 +407,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, do_ask(payload.get("config", {}), payload.get("question", "")))
             if self.path == "/api/ask_doc":
                 return self._send(200, do_ask_doc(payload.get("text", ""), payload.get("config", {}), payload.get("question", "")))
+            if self.path == "/api/compare_doc":
+                return self._send(200, do_compare_doc(payload.get("text", ""), payload.get("question", ""), payload.get("gold", "")))
             if self.path == "/api/compare":
                 return self._send(200, do_compare(payload.get("question", "")))
             if self.path == "/api/sweep":
@@ -375,7 +447,8 @@ border-radius:7px;padding:6px 10px;margin-right:10px;cursor:pointer;font-family:
 .val{float:right;color:var(--txt);font-variant-numeric:tabular-nums}
 .row{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}
 button{background:var(--red);color:#fff;border:0;border-radius:8px;padding:10px 14px;font-size:14px;
-font-weight:600;cursor:pointer}button.ghost{background:#111;border:1px solid var(--bd);color:var(--txt);font-weight:500}
+font-weight:600;cursor:pointer;font-family:var(--rhd)}
+button.ghost{background:#111;border:1px solid var(--bd);color:var(--txt);font-weight:500}
 button:disabled{opacity:.5;cursor:wait}
 .chip{background:#111;border:1px solid var(--bd);color:var(--mut);border-radius:999px;padding:6px 11px;
 font-size:12px;cursor:pointer}.chip:hover{border-color:var(--red);color:var(--txt)}
@@ -425,9 +498,9 @@ padding:0 4px;font:12px var(--rhm)}
 <div class=wrap>
 <div class=tabs>
 <div class="chip on" data-tab=play>Play (one config)</div>
-<div class=chip data-tab=doc>Import your own doc</div>
 <div class=chip data-tab=cmp>Baseline vs AutoRAG</div>
 <div class=chip data-tab=sweep>Run the sweep</div>
+<div class=chip data-tab=doc>Import your own doc</div>
 <div class=chip data-tab=adopt>Adopt in your stack</div>
 </div>
 
@@ -471,8 +544,10 @@ padding:0 4px;font:12px var(--rhm)}
 <div class=card>
 <h2>Ask your document</h2>
 <input type=text id=dq placeholder="Ask something answerable from your text…">
-<div class=row style=margin-top:12px><button onclick=askDoc()>Ask</button>
-<small class=note>Runs entirely on your local 1B model — your text is embedded in-memory, not stored.</small></div>
+<input type=text id=dgold placeholder="Expected key fact (optional) — unlocks correctness + scoring" style=margin-top:8px>
+<div class=row style=margin-top:12px><button onclick=askDoc()>Ask (your config)</button>
+<button class=ghost onclick=askDocCompare()>Compare naive vs AutoRAG</button></div>
+<small class=note>Runs on your local 1B model — your text is embedded in-memory, not stored. <b>Ask</b> uses the sliders; <b>Compare</b> pits the naive baseline against the AutoRAG winner config on your doc.</small>
 <div id=dout></div>
 </div>
 </div>
@@ -512,7 +587,8 @@ function preset(which){const c=STATE[which];if(!c)return;cs.value=c.chunk_size;o
 tk.value=c.top_k;rt.value=c.retriever;sync()}
 document.querySelectorAll('.tabs .chip').forEach(t=>t.onclick=()=>{
 document.querySelectorAll('.tabs .chip').forEach(x=>x.classList.remove('on'));t.classList.add('on');
-['play','doc','cmp','sweep','adopt'].forEach(id=>$('#'+id).classList.add('hide'));$('#'+t.dataset.tab).classList.remove('hide')});
+['play','doc','cmp','sweep','adopt'].forEach(id=>$('#'+id).classList.add('hide'));$('#'+t.dataset.tab).classList.remove('hide');
+if(t.dataset.tab==='adopt')renderAdopt()});
 function esc(s){return s.replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]))}
 function chunks(r){return r.map(c=>`<div class=chunk><b>${c.doc}</b> · ${esc(c.text)}…</div>`).join('')}
 function mk(t,f,cls){if(!f)return t;const re=new RegExp('('+f.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')+')','gi');
@@ -532,7 +608,7 @@ return `<details><summary>${x.n_chunks} retrieved chunks (${x.ctx_words} words)<
 async function ask(){const question=q.value.trim();if(!question)return;
 out.innerHTML='<div class=spin>Generating on the 1B model…</div>';
 const r=await api('/api/ask',{config:cfg(),question});if(r.error){out.innerHTML='<div class=ans>⚠ '+esc(r.error)+'</div>';return}
-out.innerHTML=`<div class=ans>${esc(r.answer)}</div>
+out.innerHTML=`<div class=ans>${hl(r.answer,[],[])}</div>
 <div class=meta>chunk=${r.config.chunk_size} ov=${r.config.chunk_overlap} k=${r.config.top_k} ${r.config.retriever}
 · ${r.ctx_words} context words · ${r.latency_s}s</div>
 <h2 style=margin-top:14px>Retrieved context</h2>${chunks(r.retrieved)}`}
@@ -550,6 +626,31 @@ if(r.error){dout.innerHTML='<div class=ans>⚠ '+esc(r.error)+'</div>';return}
 dout.innerHTML=`<div class=ans>${hl(r.answer,[],[])}</div>
 <div class=meta>${r.n_chunks_total} chunks indexed · ${r.ctx_words} words retrieved · ${r.latency_s}s${r.truncated?' · doc truncated to 20k words':''}</div>
 <h2 style=margin-top:14px>Retrieved from your document</h2>${chunks(r.retrieved)}`}
+async function askDocCompare(){const text=doctext.value.trim(),question=dq.value.trim(),gold=dgold.value.trim();
+if(!text){dout.innerHTML='<div class=ans>Paste or upload a document first.</div>';return}
+if(!question){dout.innerHTML='<div class=ans>Ask a question about your document.</div>';return}
+dout.innerHTML='<div class=spin>Running naive vs AutoRAG on your document…</div>';
+const r=await api('/api/compare_doc',{text,question,gold});
+if(r.error){dout.innerHTML='<div class=ans>⚠ '+esc(r.error)+'</div>';return}
+renderDocCompare(r)}
+function renderDocCompare(r){const b=r.baseline,w=r.winner,gold=r.gold;
+const rank=x=>x.answer_rank?('#'+x.answer_rank+' of '+x.n_chunks):'—';
+let rows='';
+if(gold){rows+=`<tr><td class=metric>Got it right?</td><td>${verdict(b.correct)}</td><td>${verdict(w.correct)}</td><td class=note2>did the answer state your key fact</td></tr>`
++`<tr><td class=metric>Answer quality</td><td class=b>${b.score}</td><td class=w>${w.score}</td><td class=note2>0–1 vs your key fact</td></tr>`}
+rows+=`<tr><td class=metric>Context fed to model</td><td class=b>${b.ctx_words}w · ${b.n_chunks} chunks</td><td class=w>${w.ctx_words}w · ${w.n_chunks} chunks</td><td class=note2>−${r.cut}% less to read</td></tr>`;
+if(gold)rows+=`<tr><td class=metric>Answer-bearing chunk ranked</td><td class=b>${rank(b)}</td><td class=w>${rank(w)}</td><td class=note2>higher = model attends more</td></tr>`;
+rows+=`<tr><td class=metric>Competing figures in context</td><td class=b>${b.n_distractors}</td><td class=w>${w.n_distractors}</td><td class=note2>colliding $/days/% that mislead</td></tr>`;
+const col=(x,cls,name)=>`<div><span class="tag ${cls}">${name}</span> ${gold?verdict(x.correct):''}
+<div class=ans>${hl(x.answer,x.gold_facts,x.wrong_facts)}</div>
+<div class=meta>${x.ctx_words} ctx words · ${x.n_distractors} competing figures · ${x.latency_s}s</div>
+${chunkList(x,gold||'')}</div>`;
+dout.innerHTML=`<div class=meta style=margin-bottom:4px><b>Q:</b> ${esc(r.question)}</div>
+${gold?'<div class=meta style=margin-bottom:8px><b>Your key fact:</b> <mark class=good>'+esc(gold)+'</mark></div>':'<div class=meta style=margin-bottom:8px>Add an “expected key fact” above to also score correctness.</div>'}
+<table class=difftable><tr><th>What differs</th><th>Naive baseline</th><th>AutoRAG winner</th><th></th></tr>${rows}</table>
+<h2 style=margin-top:4px>Why they differ</h2><ul class=why>${r.why.map(s=>'<li>'+esc(s)+'</li>').join('')}</ul>
+<h2 style=margin-top:14px>The two answers${gold?' <small class=note>· <mark class=good>green</mark> = your fact, <mark class=bad>red</mark> = figure not in it</small>':''}</h2>
+<div class=cmp>${col(b,'b','Naive baseline')}${col(w,'w','AutoRAG winner')}</div>`}
 async function compare(){const question=cqsel.value;if(!question)return;
 cout.innerHTML='<div class=spin>Running both configs on the 1B model…</div>';
 const r=await api('/api/compare',{question});if(r.error){cout.innerHTML='<div class=ans>⚠ '+esc(r.error)+'</div>';return}
@@ -587,40 +688,74 @@ STATE.winner=r.rows[0].config;renderAdopt()}
 function pre(code){return '<pre><code>'+esc(code)+'</code><button class=copy onclick="cp(this)">copy</button></pre>'}
 function cp(b){navigator.clipboard.writeText(b.previousElementSibling.textContent);b.textContent='copied';setTimeout(()=>b.textContent='copy',1200)}
 function renderAdopt(){const c=STATE.winner,W=c.chunk_size,O=c.chunk_overlap,K=c.top_k,R=c.retriever;
-const lc='from langchain_text_splitters import RecursiveCharacterTextSplitter\n\n'
-+'# AutoRAG winner on THIS data: chunk='+W+'w  overlap='+O+'w  k='+K+'  '+R+'\n'
-+'# chunk size is in WORDS here; LangChain counts characters, so x5 (or use a token splitter)\n'
-+'splitter = RecursiveCharacterTextSplitter(chunk_size='+(W*5)+', chunk_overlap='+(O*5)+')\n'
-+'retriever = vectordb.as_retriever(search_kwargs={"k": '+K+'})';
-const li='from llama_index.core.node_parser import SentenceSplitter\n\n'
+const raw=(doctext.value||'').trim();const hasdoc=raw.length>0;
+const TQ=String.fromCharCode(34).repeat(3);
+const docex=(hasdoc?raw.slice(0,700):'Paste your document text here — or import one in the "Import your own doc" tab.').replace(new RegExp(TQ,'g'),'\\"\\"\\"');
+const q=((dq.value||'').trim()||'What are the key terms?').replace(/"/g,'\\"');
+const hyb=R==='hybrid';
+const lab='# End-to-end on YOUR document, with the AutoRAG-winning config.\n'
++'# This IS the playground\'s code: model_client.py + rag/ — pure stdlib + Ollama, ~200 lines you own.\n'
++'import model_client as mc                 # Ollama | vLLM | OpenAI-compatible | stub (one interface)\n'
++'from rag.chunk import build_chunks\n'
++'from rag.pipeline import build_store, answer\n\n'
++'document = '+TQ+docex+TQ+'\n\n'
++'cfg = {"chunk_size": '+W+', "chunk_overlap": '+O+', "top_k": '+K+', "retriever": "'+R+'"}  # <- sweep winner\n\n'
++'chunks = build_chunks([{"doc": "your-doc", "text": document}], cfg["chunk_size"], cfg["chunk_overlap"])\n'
++'store  = build_store(chunks, mc.embed([c["text"] for c in chunks]))   # embed once, reuse\n\n'
++'q = "'+q+'"\n'
++'ans, hits = answer(store, q, mc.embed(q)[0], cfg)   # retrieve ('+R+', k='+K+') -> generate\n'
++'print(ans)\n'
++'print("from:", [h["id"] for h in hits])';
+const lc='# Same winner config wired into LangChain (FAISS + local Ollama).\n'
++'from langchain_text_splitters import RecursiveCharacterTextSplitter\n'
++'from langchain_community.vectorstores import FAISS\n'
++'from langchain_ollama import OllamaEmbeddings, ChatOllama\n'
++(hyb?'from langchain.retrievers import EnsembleRetriever\nfrom langchain_community.retrievers import BM25Retriever\n':'')
++'from langchain.chains import RetrievalQA\n\n'
++'document = '+TQ+docex+TQ+'\n\n'
++'# AutoRAG chunk size is in WORDS; LangChain counts characters, so x5 (or use a token splitter).\n'
++'docs = RecursiveCharacterTextSplitter(chunk_size='+(W*5)+', chunk_overlap='+(O*5)+').create_documents([document])\n'
++'vs   = FAISS.from_documents(docs, OllamaEmbeddings(model="nomic-embed-text"))\n'
++(hyb
+  ?'dense = vs.as_retriever(search_kwargs={"k": '+K+'})\nbm25  = BM25Retriever.from_documents(docs); bm25.k = '+K+'\nretriever = EnsembleRetriever(retrievers=[bm25, dense], weights=[0.5, 0.5])  # hybrid (RRF-like)\n'
+  :'retriever = vs.as_retriever(search_kwargs={"k": '+K+'})\n')
++'qa = RetrievalQA.from_chain_type(llm=ChatOllama(model="llama3.2:1b", temperature=0), retriever=retriever)\n'
++'print(qa.invoke("'+q+'")["result"])';
+const li='# LlamaIndex equivalent (chunk size in tokens ~ words here).\n'
++'from llama_index.core.node_parser import SentenceSplitter\n'
 +'splitter = SentenceSplitter(chunk_size='+W+', chunk_overlap='+O+')\n'
-+'query_engine = index.as_query_engine(similarity_top_k='+K+')';
-const env='# point the SAME sweep at a vLLM endpoint (e.g. on Red Hat OpenShift AI)\n'
-+'export BACKEND=openai\n'
-+'export OPENAI_BASE=https://<your-vllm-route>/v1\n'
-+'export CHAT_MODEL=<served-model-name>\n'
-+'python3 autorag.py sweep';
++'query_engine = index.as_query_engine(similarity_top_k='+K+')\n'
++'print(query_engine.query("'+q+'"))';
+const env='# Scale out: keep the code, point the model at a vLLM endpoint on Red Hat OpenShift AI.\n'
++'# (1) the lab client — one env switch:\n'
++'export BACKEND=openai OPENAI_BASE=https://<vllm-route>/v1 CHAT_MODEL=<served-model>\n\n'
++'# (2) or in LangChain, swap the two local clients for OpenAI-compatible ones:\n'
++'from langchain_openai import ChatOpenAI, OpenAIEmbeddings\n'
++'llm = ChatOpenAI(base_url="https://<vllm-route>/v1", api_key="EMPTY", model="<served-model>")\n'
++'emb = OpenAIEmbeddings(base_url="https://<vllm-route>/v1", api_key="EMPTY", model="<embed-model>")';
 $('#adopt').innerHTML=`<div class=card>
-<h2>Your current winning config</h2>
+<h2>Your winning config</h2>
 <div class=cfgline>chunk=<b>${W}</b> words · overlap=<b>${O}</b> · top-k=<b>${K}</b> · retriever=<b>${R}</b></div>
-<small class=note>What the sweep found on the loaded corpus + eval set. Swap in your data, re-run the sweep, and these numbers change.</small>
-<h2 style=margin-top:18px>Paste it into your stack</h2>
-<div class="tag n">LangChain</div>${pre(lc)}
-<div class="tag n">LlamaIndex</div>${pre(li)}
-<div class="tag n">Scale to vLLM / OpenShift AI — same code, one env var</div>${pre(env)}
-<h2 style=margin-top:8px>Use a different vector DB? Keep the sweep, swap two functions</h2>
-${pre('def index(chunks) -> store               # embed + insert (FAISS / Chroma / pgvector)\ndef retrieve(store, query, k) -> chunks   # dense / lexical / hybrid')}
-<small class=note>See where they're called in <code>rag/pipeline.py</code>; reference store is <code>rag/store.py</code>.</small>
-<h2 style=margin-top:18px>Make it your own (2 swaps)</h2>
+<small class=note>${hasdoc?'Scripts below are filled in with the document + question from the “Import your own doc” tab.':'Tip: import a document and type a question in the “Import your own doc” tab, then reopen this tab — these scripts auto-fill with your text.'}</small>
+<h2 style=margin-top:18px>Run it on your document — the lab's own code (no framework)</h2>
+<small class=note>Copy <code>model_client.py</code> + <code>rag/</code> into your project and this runs as-is.</small>
+${pre(lab)}
+<h2 style=margin-top:8px>Wire the same config into LangChain</h2>${pre(lc)}
+<h2 style=margin-top:8px>LlamaIndex</h2>${pre(li)}
+<h2 style=margin-top:8px>Scale to vLLM / OpenShift AI — same code</h2>${pre(env)}
+<h2 style=margin-top:8px>Different vector DB? Keep the sweep, implement two functions</h2>
+${pre('def index(chunks) -> store                # embed + insert (FAISS / Chroma / pgvector)\ndef retrieve(store, query, k) -> chunks    # dense / lexical / hybrid')}
+<small class=note>They're called in <code>rag/pipeline.py</code>; the reference store is <code>rag/store.py</code>.</small>
+<h2 style=margin-top:18px>Tune on your data (2 swaps)</h2>
 <ol class=steps>
-<li><b>Your corpus</b> — replace <code>corpus/*.md</code> with your documents.</li>
-<li><b>Your eval</b> — replace <code>eval/qa.jsonl</code> with ~15–20 real questions, each with a <code>gold</code> phrase that must be retrieved. Then run <code>python3 autorag.py sweep</code>.</li>
+<li><b>Your corpus</b> — replace <code>corpus/*.md</code> (or import a doc in the doc tab).</li>
+<li><b>Your eval</b> — replace <code>eval/qa.jsonl</code> with ~15–20 real questions, each with a <code>gold</code> phrase that must be retrieved, then <code>python3 autorag.py sweep</code> to re-find the winner above.</li>
 </ol>
-<small class=note>Full guide in <code>autorag/ADOPT.md</code>. The whole optimizer is ~200 lines — read it, copy it, it's yours. AutoRAG is a technique, not a platform lock-in.</small>
+<small class=note>Full guide: <code>autorag/ADOPT.md</code>. AutoRAG is a technique, not a platform lock-in.</small>
 </div>`}
 (async()=>{STATE=await fetch('/api/state').then(r=>r.json());
 $('#backend').textContent=STATE.backend+'  ·  '+STATE.corpus_docs+' docs · '+STATE.eval_n+' eval Qs';
-samples.innerHTML=STATE.samples.map(s=>`<span class=chip onclick="q.value=this.textContent;ask()">${esc(s.slice(0,42))}…</span>`).join('');
+samples.innerHTML=STATE.samples.map(s=>`<span class=chip onclick="q.value=this.textContent;ask()">${esc(s)}</span>`).join('');
 cqsel.innerHTML=STATE.questions.map(s=>`<option>${esc(s)}</option>`).join('');
 cqsel.value=STATE.questions.find(q=>q.includes('lost debit card'))||STATE.questions[0];
 preset('winner');renderAdopt()})();
