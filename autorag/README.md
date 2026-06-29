@@ -56,6 +56,20 @@ generation would take an hour. You spend the LLM budget once, on the final A/B.
 
 ## Run it
 
+### Playground (browser) — easiest way to poke at it
+
+```bash
+python3 serve.py            # → http://localhost:7700  (PORT=8800 to change)
+```
+
+A tiny local web UI (pure stdlib, nothing to install) over the *same* pipeline:
+
+- **Play** — drag the chunk-size / overlap / top-k sliders, pick a retriever, ask
+  a question, and read the 1B model's answer plus the exact chunks it retrieved.
+- **Baseline vs AutoRAG** — same question, both configs, side by side: watch the
+  naive baseline's noisy context produce a worse (or wrong) answer.
+- **Run the sweep** — score every config in the browser and set the winner.
+
 ### Option A — Ollama (laptop-first, zero Python deps)
 
 ```bash
