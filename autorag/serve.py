@@ -449,6 +449,7 @@ border-radius:7px;padding:6px 10px;margin-right:10px;cursor:pointer;font-family:
 button{background:var(--red);color:#fff;border:0;border-radius:8px;padding:10px 14px;font-size:14px;
 font-weight:600;cursor:pointer;font-family:var(--rhd)}
 button.ghost{background:#111;border:1px solid var(--bd);color:var(--txt);font-weight:500}
+button.preset.active{border-color:var(--red);color:#fff;background:#1a0d0d;box-shadow:0 0 0 1px var(--red) inset}
 button:disabled{opacity:.5;cursor:wait}
 .chip{background:#111;border:1px solid var(--bd);color:var(--mut);border-radius:999px;padding:6px 11px;
 font-size:12px;cursor:pointer}.chip:hover{border-color:var(--red);color:var(--txt)}
@@ -509,8 +510,8 @@ padding:0 4px;font:12px var(--rhm)}
 <div class=grid>
 <div class=card>
 <h2>Retrieval config</h2>
-<div class=row><button class="ghost preset" onclick="preset('baseline')">Naive baseline</button>
-<button class="ghost preset" onclick="preset('winner')">AutoRAG winner</button></div>
+<div class=row><button id=presetBase class="ghost preset" onclick="preset('baseline')">Naive baseline</button>
+<button id=presetWin class="ghost preset" onclick="preset('winner')">AutoRAG winner</button></div>
 <label>Chunk size <span class=val id=csv>150</span></label><input type=range id=cs min=20 max=300 step=10 value=150>
 <label>Overlap <span class=val id=ovv>30</span></label><input type=range id=ov min=0 max=120 step=10 value=30>
 <label>Top-k <span class=val id=tkv>3</span></label><input type=range id=tk min=1 max=10 step=1 value=3>
@@ -582,9 +583,12 @@ const $=s=>document.querySelector(s), api=(p,b)=>fetch(p,{method:'POST',body:JSO
 let STATE={};
 function cfg(){return{chunk_size:+cs.value,chunk_overlap:+ov.value,top_k:+tk.value,retriever:rt.value}}
 function sync(){csv.textContent=cs.value;ovv.textContent=ov.value;tkv.textContent=tk.value}
-['input','change'].forEach(e=>['cs','ov','tk'].forEach(id=>$('#'+id).addEventListener(e,sync)));
+function clearPreset(){presetBase.classList.remove('active');presetWin.classList.remove('active')}
+['input','change'].forEach(e=>['cs','ov','tk'].forEach(id=>$('#'+id).addEventListener(e,()=>{sync();clearPreset()})));
+rt.addEventListener('change',clearPreset);
 function preset(which){const c=STATE[which];if(!c)return;cs.value=c.chunk_size;ov.value=c.chunk_overlap;
-tk.value=c.top_k;rt.value=c.retriever;sync()}
+tk.value=c.top_k;rt.value=c.retriever;sync();
+presetBase.classList.toggle('active',which==='baseline');presetWin.classList.toggle('active',which==='winner')}
 document.querySelectorAll('.tabs .chip').forEach(t=>t.onclick=()=>{
 document.querySelectorAll('.tabs .chip').forEach(x=>x.classList.remove('on'));t.classList.add('on');
 ['play','doc','cmp','sweep','adopt'].forEach(id=>$('#'+id).classList.add('hide'));$('#'+t.dataset.tab).classList.remove('hide');
