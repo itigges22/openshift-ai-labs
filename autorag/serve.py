@@ -608,7 +608,9 @@ function esc(s){return s.replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'
 function chunks(r){return r.map(c=>`<div class=chunk><b>${c.doc}</b> · ${esc(c.text)}…</div>`).join('')}
 function mk(t,f,cls){if(!f)return t;const re=new RegExp('('+f.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')+')','gi');
 return t.replace(re,'<mark class="'+cls+'">$1</mark>')}
-function hl(text,good,bad){let t=esc(text.replace(/\*\*/g,''));
+function hl(text,good,bad){
+let raw=text.replace(/\*\*/g,'').replace(/^\s*#+\s*/,'').replace(/^\s*[-*]\s+/,'').trim();
+let t=esc(raw);
 (good||[]).slice().sort((a,b)=>b.length-a.length).forEach(f=>t=mk(t,f,'good'));
 (bad||[]).slice().sort((a,b)=>b.length-a.length).forEach(f=>t=mk(t,f,'bad'));return t}
 function hlChunk(text,goldSub,dist){let t=esc(text.replace(/\*\*/g,''));t=mk(t,goldSub,'good');

@@ -13,9 +13,14 @@ from rag.store import VectorStore
 
 
 SYSTEM = (
-    "You are a bank's card-disputes support assistant. Answer ONLY from the "
-    "provided context. If the context does not contain the answer, say you don't "
-    "know. Be concise and cite policy terms when relevant."
+    "You answer strictly from the provided context. Give the answer directly in "
+    "one or two sentences, and quote the specific figure (number of days, dollar "
+    "amount, reason code, name) when the context provides one. "
+    "If the context does not contain the answer, reply with exactly: I don't know. "
+    "Do not restate the question. Do not add disclaimers, caveats about the user's "
+    "specific situation, or suggestions to contact anyone unless the context itself "
+    "says to. No preamble — start with the answer. Reply in plain prose: no "
+    "bullet points, no markdown, no bold."
 )
 
 
