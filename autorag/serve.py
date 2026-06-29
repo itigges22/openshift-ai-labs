@@ -37,6 +37,7 @@ BASELINE = {"chunk_size": 250, "chunk_overlap": 0, "top_k": 8, "retriever": "den
 DOCS = load_corpus(CORPUS_DIR)
 _store_cache = {}      # (size, overlap) -> VectorStore
 _qvec_cache = {}       # text -> vector
+_doc_cache = {}        # (hash(text), size, overlap) -> VectorStore  (user-imported docs)
 
 
 def get_store(size, overlap):
@@ -178,6 +179,35 @@ def run_one(config, question, item):
     }
 
 
+def do_ask_doc(text, config, question):
+    text = (text or "").strip()
+    if not text:
+        return {"error": "Paste or upload a document first."}
+    if not (question or "").strip():
+        return {"error": "Ask a question about your document."}
+    words = text.split()
+    truncated = len(words) > 20000
+    if truncated:
+        text = " ".join(words[:20000])
+    config = clean_config(config)
+    key = (hash(text), config["chunk_size"], config["chunk_overlap"])
+    if key not in _doc_cache:
+        chunks = build_chunks([{"doc": "your-document", "text": text}],
+                              config["chunk_size"], config["chunk_overlap"])
+        vecs = mc.embed([c["text"] for c in chunks])
+        _doc_cache[key] = build_store(chunks, vecs)
+    store = _doc_cache[key]
+    t0 = time.time()
+    ans, retrieved = answer(store, question, qvec(question), config)
+    dt = time.time() - t0
+    return {
+        "answer": ans, "config": config, "latency_s": round(dt, 2),
+        "ctx_words": sum(len(c["text"].split()) for c in retrieved),
+        "n_chunks_total": len(store.chunks), "truncated": truncated,
+        "retrieved": [{"id": c["id"], "doc": c["doc"], "text": c["text"][:400]} for c in retrieved],
+    }
+
+
 def do_compare(question):
     item = find_eval(question)
     base = run_one(BASELINE, question, item)
@@ -277,6 +307,12 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/" or self.path.startswith("/?"):
             return self._send(200, PAGE.encode("utf-8"), "text/html; charset=utf-8")
+        if self.path == "/logo.svg":
+            try:
+                with open(os.path.join(HERE, "assets", "redhat-logo.svg"), "rb") as f:
+                    return self._send(200, f.read(), "image/svg+xml")
+            except OSError:
+                return self._send(404, {"error": "logo not found"})
         if self.path == "/api/state":
             ev = load_eval()
             return self._send(200, {
@@ -299,6 +335,8 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if self.path == "/api/ask":
                 return self._send(200, do_ask(payload.get("config", {}), payload.get("question", "")))
+            if self.path == "/api/ask_doc":
+                return self._send(200, do_ask_doc(payload.get("text", ""), payload.get("config", {}), payload.get("question", "")))
             if self.path == "/api/compare":
                 return self._send(200, do_compare(payload.get("question", "")))
             if self.path == "/api/sweep":
@@ -312,21 +350,28 @@ class Handler(BaseHTTPRequestHandler):
 
 PAGE = r"""<!doctype html><html lang=en><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1">
-<title>AutoRAG Playground · Red Hat OpenShift AI</title>
+<title>Red Hat OpenShift AI · AutoRAG</title>
 <style>
-:root{--red:#ee0000;--ink:#151515;--card:#1e1e1e;--bd:#2a2a2a;--mut:#a0a0a0;--txt:#e6e6e6;--grn:#3ea76a}
-*{box-sizing:border-box}body{margin:0;background:var(--ink);color:var(--txt);
-font:15px/1.5 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif}
-header{display:flex;align-items:center;gap:12px;padding:14px 22px;border-bottom:1px solid var(--bd);background:#0e0e0e}
-header .dot{width:11px;height:11px;border-radius:50%;background:var(--red)}
+@import url('https://fonts.googleapis.com/css2?family=Red+Hat+Display:wght@400;500;700;900&family=Red+Hat+Mono:wght@400;500&display=swap');
+:root{--red:#ee0000;--ink:#151515;--card:#1e1e1e;--bd:#2a2a2a;--mut:#a0a0a0;--txt:#e6e6e6;--grn:#3ea76a;
+--rhd:'Red Hat Display',-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;
+--rhm:'Red Hat Mono',ui-monospace,SFMono-Regular,Menlo,monospace}
+*{box-sizing:border-box}body{margin:0;background:var(--ink);color:var(--txt);zoom:1.3;
+font:15px/1.55 var(--rhd)}
+header{display:flex;align-items:center;gap:14px;padding:14px 22px;border-bottom:1px solid var(--bd);background:#0e0e0e}
+header .logo{height:27px;width:auto;display:block}
 header b{font-weight:700}header span{color:var(--mut);font-size:13px}
 .wrap{max-width:1080px;margin:0 auto;padding:22px}
 .grid{display:grid;grid-template-columns:300px 1fr;gap:20px}
 .card{background:var(--card);border:1px solid var(--bd);border-radius:12px;padding:16px}
 h2{font-size:13px;text-transform:uppercase;letter-spacing:.06em;color:var(--mut);margin:0 0 12px}
 label{display:block;font-size:12px;color:var(--mut);margin:12px 0 4px}
-input[type=range]{width:100%}select,input[type=text]{width:100%;background:#111;color:var(--txt);
-border:1px solid var(--bd);border-radius:8px;padding:9px 10px;font-size:14px}
+input[type=range]{width:100%}select,input[type=text],textarea{width:100%;background:#111;color:var(--txt);
+border:1px solid var(--bd);border-radius:8px;padding:9px 10px;font-size:14px;font-family:var(--rhd)}
+textarea{resize:vertical;line-height:1.5;margin-top:6px}
+input[type=file]{font-size:12px;color:var(--mut);margin-top:6px;font-family:var(--rhd)}
+input[type=file]::file-selector-button{background:#111;color:var(--txt);border:1px solid var(--bd);
+border-radius:7px;padding:6px 10px;margin-right:10px;cursor:pointer;font-family:var(--rhd)}
 .val{float:right;color:var(--txt);font-variant-numeric:tabular-nums}
 .row{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}
 button{background:var(--red);color:#fff;border:0;border-radius:8px;padding:10px 14px;font-size:14px;
@@ -366,7 +411,7 @@ mark.dist{background:#3a2a14;color:#ffce8a;border-radius:4px;padding:0 3px}
 details summary{cursor:pointer;color:var(--mut);font-size:12px;margin-top:8px}
 .qpick{display:flex;gap:8px;align-items:center}.qpick select{flex:1}
 pre{position:relative;background:#0d0d0d;border:1px solid var(--bd);border-radius:8px;padding:12px;overflow:auto;
-font:12.5px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;color:#d4d4d4;margin:4px 0 14px}
+font:12.5px/1.5 var(--rhm);color:#d4d4d4;margin:4px 0 14px}
 pre code{white-space:pre}
 .copy{position:absolute;top:8px;right:8px;background:#222;border:1px solid var(--bd);color:var(--mut);
 font-size:11px;padding:3px 8px;border-radius:6px;font-weight:500;cursor:pointer}
@@ -374,12 +419,13 @@ font-size:11px;padding:3px 8px;border-radius:6px;font-weight:500;cursor:pointer}
 .tag.n{background:#222;color:#cfcfcf}
 ol.steps{margin:6px 0;padding-left:20px}ol.steps li{margin:8px 0;color:#d4d4d4}
 ol.steps code,small code,.note code,li code{background:#0d0d0d;border:1px solid var(--bd);border-radius:4px;
-padding:0 4px;font:12px ui-monospace,monospace}
+padding:0 4px;font:12px var(--rhm)}
 </style></head><body>
-<header><i class=dot></i><b>AutoRAG Playground</b><span id=backend>Red Hat OpenShift AI · connecting…</span></header>
+<header><img class=logo src="/logo.svg" alt="Red Hat"><span id=backend>OpenShift AI · connecting…</span></header>
 <div class=wrap>
 <div class=tabs>
 <div class="chip on" data-tab=play>Play (one config)</div>
+<div class=chip data-tab=doc>Import your own doc</div>
 <div class=chip data-tab=cmp>Baseline vs AutoRAG</div>
 <div class=chip data-tab=sweep>Run the sweep</div>
 <div class=chip data-tab=adopt>Adopt in your stack</div>
@@ -404,6 +450,30 @@ padding:0 4px;font:12px ui-monospace,monospace}
 <div class=row id=samples></div>
 <div class=row style=margin-top:12px><button onclick=ask()>Ask</button></div>
 <div id=out></div>
+</div>
+</div>
+</section>
+
+<!-- DOC -->
+<section id=doc class=hide>
+<div class=grid>
+<div class=card>
+<h2>Your document</h2>
+<input type=file id=docfile accept=".txt,.md,.markdown,.text,text/plain">
+<small class=note>upload a .txt / .md file, or paste below — then ask questions answerable from it</small>
+<textarea id=doctext rows=11 placeholder="Paste a policy, a README, meeting notes, a contract… any text."></textarea>
+<h2 style=margin-top:14px>Retrieval config</h2>
+<label>Chunk size <span class=val id=dcsv>150</span></label><input type=range id=dcs min=20 max=300 step=10 value=150>
+<label>Top-k <span class=val id=dtkv>3</span></label><input type=range id=dtk min=1 max=10 step=1 value=3>
+<label>Retriever</label><select id=drt><option value=dense>dense (semantic)</option>
+<option value=lexical>lexical (BM25-lite)</option><option value=hybrid>hybrid (RRF)</option></select>
+</div>
+<div class=card>
+<h2>Ask your document</h2>
+<input type=text id=dq placeholder="Ask something answerable from your text…">
+<div class=row style=margin-top:12px><button onclick=askDoc()>Ask</button>
+<small class=note>Runs entirely on your local 1B model — your text is embedded in-memory, not stored.</small></div>
+<div id=dout></div>
 </div>
 </div>
 </section>
@@ -442,7 +512,7 @@ function preset(which){const c=STATE[which];if(!c)return;cs.value=c.chunk_size;o
 tk.value=c.top_k;rt.value=c.retriever;sync()}
 document.querySelectorAll('.tabs .chip').forEach(t=>t.onclick=()=>{
 document.querySelectorAll('.tabs .chip').forEach(x=>x.classList.remove('on'));t.classList.add('on');
-['play','cmp','sweep','adopt'].forEach(id=>$('#'+id).classList.add('hide'));$('#'+t.dataset.tab).classList.remove('hide')});
+['play','doc','cmp','sweep','adopt'].forEach(id=>$('#'+id).classList.add('hide'));$('#'+t.dataset.tab).classList.remove('hide')});
 function esc(s){return s.replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]))}
 function chunks(r){return r.map(c=>`<div class=chunk><b>${c.doc}</b> · ${esc(c.text)}…</div>`).join('')}
 function mk(t,f,cls){if(!f)return t;const re=new RegExp('('+f.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')+')','gi');
@@ -466,6 +536,20 @@ out.innerHTML=`<div class=ans>${esc(r.answer)}</div>
 <div class=meta>chunk=${r.config.chunk_size} ov=${r.config.chunk_overlap} k=${r.config.top_k} ${r.config.retriever}
 · ${r.ctx_words} context words · ${r.latency_s}s</div>
 <h2 style=margin-top:14px>Retrieved context</h2>${chunks(r.retrieved)}`}
+docfile.addEventListener('change',e=>{const f=e.target.files[0];if(!f)return;
+const r=new FileReader();r.onload=()=>{doctext.value=r.result;dq.focus()};r.readAsText(f)});
+['input','change'].forEach(e=>['dcs','dtk'].forEach(id=>$('#'+id).addEventListener(e,()=>{
+dcsv.textContent=dcs.value;dtkv.textContent=dtk.value})));
+async function askDoc(){const text=doctext.value.trim(),question=dq.value.trim();
+if(!text){dout.innerHTML='<div class=ans>Paste or upload a document first.</div>';return}
+if(!question){dout.innerHTML='<div class=ans>Ask a question about your document.</div>';return}
+dout.innerHTML='<div class=spin>Indexing your document and generating on the 1B model…</div>';
+const cfg={chunk_size:+dcs.value,chunk_overlap:Math.round(dcs.value*0.2),top_k:+dtk.value,retriever:drt.value};
+const r=await api('/api/ask_doc',{text,question,config:cfg});
+if(r.error){dout.innerHTML='<div class=ans>⚠ '+esc(r.error)+'</div>';return}
+dout.innerHTML=`<div class=ans>${hl(r.answer,[],[])}</div>
+<div class=meta>${r.n_chunks_total} chunks indexed · ${r.ctx_words} words retrieved · ${r.latency_s}s${r.truncated?' · doc truncated to 20k words':''}</div>
+<h2 style=margin-top:14px>Retrieved from your document</h2>${chunks(r.retrieved)}`}
 async function compare(){const question=cqsel.value;if(!question)return;
 cout.innerHTML='<div class=spin>Running both configs on the 1B model…</div>';
 const r=await api('/api/compare',{question});if(r.error){cout.innerHTML='<div class=ans>⚠ '+esc(r.error)+'</div>';return}
